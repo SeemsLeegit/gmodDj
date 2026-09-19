@@ -5,123 +5,30 @@
 <title>wdj youtube embed</title>
 <style>
   html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #000; }
-  #player, #player iframe { width: 100%; height: 100%; display: block; border: 0; }
+  iframe { width: 100%; height: 100%; display: block; border: 0; }
 </style>
 </head>
 <body>
-<div id="player"></div>
-
-<script src="https://www.youtube.com/iframe_api"></script>
 <script>
 // ---------------------------------------------------------------------
 // Replacement embed page for wyozi's medialib "youtube" service.
 // Loaded inside GMod's hidden DHTML panel. Talks to Lua via:
 //   - window.medialibDelegate.run(name, args)  <- called FROM Lua
 //   - medialiblua.Event(name, jsonString)      -> called INTO Lua
-// (exact contract expected by lib_medialib.lua's HTMLMedia class)
+//
+// v2: does NOT load the official youtube.com/iframe_api script anymore -
+// its internally lazy-loaded sub-chunks failed to load inside GMod's
+// HTML panel. Talks directly to a bare YouTube embed <iframe> using the
+// raw, documented postMessage protocol instead (much smaller surface,
+// nothing extra to fetch beyond the iframe itself).
 // ---------------------------------------------------------------------
 
-var params = new URLSearchParams(location.search);
-var videoId = params.get('id');
-
-var player = null;
-var playerReady = false;
 var pendingCommands = [];
 var currentVolume = 1; // 0..1, matches medialib's volume range
-var wantsUnmuteAfterPlay = false;
 
-function sendEvent(name, data) {
-  if (window.medialiblua && medialiblua.Event) {
-    medialiblua.Event(name, JSON.stringify(data || {}));
-  }
-}
-
-function onYouTubeIframeAPIReady() {
-  player = new YT.Player('player', {
-    width: '100%',
-    height: '100%',
-    videoId: videoId,
-    playerVars: {
-      autoplay: 0,
-      mute: 1,          // always start muted so a later programmatic play()
-      controls: 0,       // is never blocked by the browser's autoplay policy
-      disablekb: 1,
-      fs: 0,
-      modestbranding: 1,
-      playsinline: 1,
-      rel: 0,
-      iv_load_policy: 3
-    },
-    events: {
-      onReady: onPlayerReady,
-      onStateChange: onPlayerStateChange,
-      onError: onPlayerError
-    }
-  });
-}
-
-function onPlayerReady() {
-  playerReady = true;
-  player.setVolume(Math.round(currentVolume * 100));
-  sendEvent('playerLoaded', {});
-
-  var queue = pendingCommands;
-  pendingCommands = [];
-  queue.forEach(runCommandNow);
-}
-
-function onPlayerStateChange(e) {
-  var state = e.data;
-  if (state === YT.PlayerState.PLAYING) {
-    if (wantsUnmuteAfterPlay) {
-      // video is already playing (muted autoplay is always allowed) -
-      // unmuting an already-playing element is NOT blocked by autoplay policy
-      player.unMute();
-      wantsUnmuteAfterPlay = false;
-    }
-    sendEvent('stateChange', { state: 'playing', time: player.getCurrentTime() });
-  } else if (state === YT.PlayerState.PAUSED) {
-    sendEvent('stateChange', { state: 'paused', time: player.getCurrentTime() });
-  } else if (state === YT.PlayerState.BUFFERING) {
-    sendEvent('stateChange', { state: 'buffering', time: player.getCurrentTime() });
-  } else if (state === YT.PlayerState.ENDED) {
-    sendEvent('stateChange', { state: 'ended' });
-  }
-}
-
-function onPlayerError(e) {
-  var messages = {
-    2: 'Ungueltige Video-ID',
-    5: 'HTML5-Player-Fehler',
-    100: 'Video nicht gefunden oder entfernt',
-    101: 'Einbettung vom Ersteller deaktiviert',
-    150: 'Einbettung vom Ersteller deaktiviert'
-  };
-  sendEvent('error', { message: messages[e.data] || ('Fehlercode ' + e.data) });
-}
-
-function runCommandNow(cmd) {
-  if (!player) return;
-  if (cmd.name === 'play') {
-    wantsUnmuteAfterPlay = true;
-    player.playVideo();
-  } else if (cmd.name === 'pause') {
-    player.pauseVideo();
-  } else if (cmd.name === 'seek') {
-    player.seekTo(cmd.args.time, true);
-  } else if (cmd.name === 'setVolume') {
-    currentVolume = cmd.args.vol;
-    player.setVolume(Math.round(currentVolume * 100));
-  } else if (cmd.name === 'setQuality') {
-    // YouTube deprecated manual quality control; best-effort only, safe to ignore failures
-    try {
-      var q = cmd.args.quality === 'veryhigh' ? 'hd1080' : cmd.args.quality;
-      player.setPlaybackQuality(q);
-    } catch (err) {}
-  }
-}
-
-// Called BY Lua: panel:QueueJavascript("medialibDelegate.run('play')") etc.
+// Defined FIRST and unconditionally, before anything that could throw,
+// so Lua always has something to call even if the iframe/player below
+// fails for some reason.
 window.medialibDelegate = {
   run: function (name, args) {
     var cmd = { name: name, args: args || {} };
@@ -132,6 +39,115 @@ window.medialibDelegate = {
     }
   }
 };
+
+var params = new URLSearchParams(location.search);
+var videoId = params.get('id');
+
+var iframe = null;
+var playerReady = false;
+var wantsUnmuteAfterPlay = false;
+
+function sendEvent(name, data) {
+  if (window.medialiblua && medialiblua.Event) {
+    medialiblua.Event(name, JSON.stringify(data || {}));
+  }
+}
+
+function sendCommand(func, args) {
+  if (!iframe || !iframe.contentWindow) return;
+  iframe.contentWindow.postMessage(JSON.stringify({ event: 'command', func: func, args: args || [] }), '*');
+}
+
+function runCommandNow(cmd) {
+  if (cmd.name === 'play') {
+    wantsUnmuteAfterPlay = true;
+    sendCommand('playVideo');
+  } else if (cmd.name === 'pause') {
+    sendCommand('pauseVideo');
+  } else if (cmd.name === 'seek') {
+    sendCommand('seekTo', [cmd.args.time, true]);
+  } else if (cmd.name === 'setVolume') {
+    currentVolume = cmd.args.vol;
+    sendCommand('setVolume', [Math.round(currentVolume * 100)]);
+  } else if (cmd.name === 'setQuality') {
+    // YouTube deprecated manual quality control; best-effort only
+    var q = cmd.args.quality === 'veryhigh' ? 'hd1080' : cmd.args.quality;
+    sendCommand('setPlaybackQuality', [q]);
+  }
+}
+
+function markReady() {
+  if (playerReady) return;
+  playerReady = true;
+  sendCommand('setVolume', [Math.round(currentVolume * 100)]);
+  sendEvent('playerLoaded', {});
+  var queue = pendingCommands;
+  pendingCommands = [];
+  queue.forEach(runCommandNow);
+}
+
+var errorMessages = {
+  2: 'Ungueltige Video-ID',
+  5: 'HTML5-Player-Fehler',
+  100: 'Video nicht gefunden oder entfernt',
+  101: 'Einbettung vom Ersteller deaktiviert',
+  150: 'Einbettung vom Ersteller deaktiviert'
+};
+
+window.addEventListener('message', function (e) {
+  if (iframe && e.source !== iframe.contentWindow) return;
+  if (typeof e.data !== 'string') return;
+  var data;
+  try {
+    data = JSON.parse(e.data);
+  } catch (err) {
+    return;
+  }
+  if (!data || !data.event) return;
+
+  if (data.event === 'onReady' || data.event === 'initialDelivery') {
+    markReady();
+  } else if (data.event === 'onStateChange' || data.event === 'infoDelivery') {
+    var state = data.info;
+    if (state && typeof state === 'object') state = state.playerState;
+    if (state === 1) {
+      if (wantsUnmuteAfterPlay) {
+        sendCommand('unMute');
+        sendCommand('setVolume', [Math.round(currentVolume * 100)]);
+        wantsUnmuteAfterPlay = false;
+      }
+      sendEvent('stateChange', { state: 'playing' });
+    } else if (state === 2) {
+      sendEvent('stateChange', { state: 'paused' });
+    } else if (state === 3) {
+      sendEvent('stateChange', { state: 'buffering' });
+    } else if (state === 0) {
+      sendEvent('stateChange', { state: 'ended' });
+    }
+  } else if (data.event === 'onError') {
+    sendEvent('error', { message: errorMessages[data.info] || ('Fehlercode ' + data.info) });
+  }
+});
+
+try {
+  var origin = encodeURIComponent(location.origin || '');
+  var src = 'https://www.youtube.com/embed/' + encodeURIComponent(videoId) +
+    '?enablejsapi=1&autoplay=0&mute=1&controls=0&disablekb=1&fs=0' +
+    '&modestbranding=1&playsinline=1&rel=0&iv_load_policy=3&origin=' + origin;
+
+  iframe = document.createElement('iframe');
+  iframe.src = src;
+  iframe.setAttribute('allow', 'autoplay');
+  document.body.appendChild(iframe);
+
+  iframe.addEventListener('load', function () {
+    // give the embedded player a moment to attach its own message listener,
+    // then treat it as ready even if we never see a clean onReady message
+    setTimeout(markReady, 500);
+  });
+} catch (err) {
+  sendEvent('error', { message: 'Init-Fehler: ' + err.message });
+}
 </script>
 </body>
 </html>
