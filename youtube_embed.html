@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>wdj youtube embed</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #000; }
+  #player, #player iframe { width: 100%; height: 100%; display: block; border: 0; }
+</style>
+</head>
+<body>
+<div id="player"></div>
+
+<script src="https://www.youtube.com/iframe_api"></script>
+<script>
+// ---------------------------------------------------------------------
+// Replacement embed page for wyozi's medialib "youtube" service.
+// Loaded inside GMod's hidden DHTML panel. Talks to Lua via:
+//   - window.medialibDelegate.run(name, args)  <- called FROM Lua
+//   - medialiblua.Event(name, jsonString)      -> called INTO Lua
+// (exact contract expected by lib_medialib.lua's HTMLMedia class)
+// ---------------------------------------------------------------------
+
+var params = new URLSearchParams(location.search);
+var videoId = params.get('id');
+
+var player = null;
+var playerReady = false;
+var pendingCommands = [];
+var currentVolume = 1; // 0..1, matches medialib's volume range
+var wantsUnmuteAfterPlay = false;
+
+function sendEvent(name, data) {
+  if (window.medialiblua && medialiblua.Event) {
+    medialiblua.Event(name, JSON.stringify(data || {}));
+  }
+}
+
+function onYouTubeIframeAPIReady() {
+  player = new YT.Player('player', {
+    width: '100%',
+    height: '100%',
+    videoId: videoId,
+    playerVars: {
+      autoplay: 0,
+      mute: 1,          // always start muted so a later programmatic play()
+      controls: 0,       // is never blocked by the browser's autoplay policy
+      disablekb: 1,
+      fs: 0,
+      modestbranding: 1,
+      playsinline: 1,
+      rel: 0,
+      iv_load_policy: 3
+    },
+    events: {
+      onReady: onPlayerReady,
+      onStateChange: onPlayerStateChange,
+      onError: onPlayerError
+    }
+  });
+}
+
+function onPlayerReady() {
+  playerReady = true;
+  player.setVolume(Math.round(currentVolume * 100));
+  sendEvent('playerLoaded', {});
+
+  var queue = pendingCommands;
+  pendingCommands = [];
+  queue.forEach(runCommandNow);
+}
+
+function onPlayerStateChange(e) {
+  var state = e.data;
+  if (state === YT.PlayerState.PLAYING) {
+    if (wantsUnmuteAfterPlay) {
+      // video is already playing (muted autoplay is always allowed) -
+      // unmuting an already-playing element is NOT blocked by autoplay policy
+      player.unMute();
+      wantsUnmuteAfterPlay = false;
+    }
+    sendEvent('stateChange', { state: 'playing', time: player.getCurrentTime() });
+  } else if (state === YT.PlayerState.PAUSED) {
+    sendEvent('stateChange', { state: 'paused', time: player.getCurrentTime() });
+  } else if (state === YT.PlayerState.BUFFERING) {
+    sendEvent('stateChange', { state: 'buffering', time: player.getCurrentTime() });
+  } else if (state === YT.PlayerState.ENDED) {
+    sendEvent('stateChange', { state: 'ended' });
+  }
+}
+
+function onPlayerError(e) {
+  var messages = {
+    2: 'Ungueltige Video-ID',
+    5: 'HTML5-Player-Fehler',
+    100: 'Video nicht gefunden oder entfernt',
+    101: 'Einbettung vom Ersteller deaktiviert',
+    150: 'Einbettung vom Ersteller deaktiviert'
+  };
+  sendEvent('error', { message: messages[e.data] || ('Fehlercode ' + e.data) });
+}
+
+function runCommandNow(cmd) {
+  if (!player) return;
+  if (cmd.name === 'play') {
+    wantsUnmuteAfterPlay = true;
+    player.playVideo();
+  } else if (cmd.name === 'pause') {
+    player.pauseVideo();
+  } else if (cmd.name === 'seek') {
+    player.seekTo(cmd.args.time, true);
+  } else if (cmd.name === 'setVolume') {
+    currentVolume = cmd.args.vol;
+    player.setVolume(Math.round(currentVolume * 100));
+  } else if (cmd.name === 'setQuality') {
+    // YouTube deprecated manual quality control; best-effort only, safe to ignore failures
+    try {
+      var q = cmd.args.quality === 'veryhigh' ? 'hd1080' : cmd.args.quality;
+      player.setPlaybackQuality(q);
+    } catch (err) {}
+  }
+}
+
+// Called BY Lua: panel:QueueJavascript("medialibDelegate.run('play')") etc.
+window.medialibDelegate = {
+  run: function (name, args) {
+    var cmd = { name: name, args: args || {} };
+    if (!playerReady) {
+      pendingCommands.push(cmd);
+    } else {
+      runCommandNow(cmd);
+    }
+  }
+};
+</script>
+</body>
+</html>
